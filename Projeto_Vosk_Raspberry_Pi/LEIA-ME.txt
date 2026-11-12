@@ -1,0 +1,40 @@
+PROJETO: TESTE DE VOZ COM VOSK - PORTUGUÊS BRASILEIRO
+Raspberry Pi 3B / Raspberry Pi OS sem ambiente gráfico
+
+ARQUIVOS
+- teste_voz.py: programa que captura a voz pelo microfone USB e mostra o texto.
+- instalar.sh: instala as bibliotecas e baixa o modelo de português.
+- Este arquivo: instruções.
+
+COMO USAR
+1. Copie a pasta deste projeto para o Raspberry Pi.
+2. Conecte o microfone USB.
+3. Abra o terminal dentro da pasta do projeto.
+4. Dê permissão ao instalador:
+   chmod +x instalar.sh
+5. Execute:
+   ./instalar.sh
+6. Quando terminar, inicie o teste:
+   ./ambiente/bin/python teste_voz.py
+7. Fale algumas frases em português. O texto reconhecido aparecerá no terminal.
+8. Para encerrar, pressione CTRL+C.
+
+IMPORTANTE
+- É necessário ter conexão com a internet durante a instalação para baixar as bibliotecas
+  e o modelo Vosk.
+- O modelo usado é vosk-model-small-pt-0.3, para português brasileiro.
+- O programa demonstra captura de áudio e conversão de fala em texto (STT).
+- Ele ainda NÃO executa ações como acender uma lâmpada; essa seria uma etapa posterior.
+- A qualidade depende do microfone, do ruído ambiente e do desempenho do Raspberry Pi.
+- Se o microfone não for reconhecido, execute:
+  ./ambiente/bin/python -c "import sounddevice as sd; print(sd.query_devices())"
+  e confira se o microfone USB aparece na lista.
+
+RESULTADO ESPERADO (EXEMPLO)
+Assistente iniciada!
+Fale em português.
+
+Você falou: bom dia
+Você falou: acender a luz
+
+O resultado acima é apenas um exemplo. O funcionamento real precisa ser testado no equipamento.
