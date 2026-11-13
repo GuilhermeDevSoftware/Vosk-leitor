@@ -1,96 +1,92 @@
+cd ~/projeto && cat > teste_voz.py <<'PY'
 #!/usr/bin/env python3
-"""
-Teste de reconhecimento de voz com Vosk em português brasileiro.
-Captura áudio do microfone e mostra a transcrição no terminal.
-"""
-
+import argparse
 import json
-import queue
+from pathlib import Path
 import sys
+
 import sounddevice as sd
-from vosk import Model, KaldiRecognizer
+from vosk import KaldiRecognizer, Model, SetLogLevel
 
-MODEL_PATH = "vosk-model-small-pt-0.3"
-audio_queue = queue.Queue()
-
-
-def audio_callback(indata, frames, time_info, status):
-    if status:
-        print(f"Aviso do áudio: {status}", file=sys.stderr)
-    audio_queue.put(bytes(indata))
+MODELO = Path(__file__).resolve().parent / "vosk-model-small-pt-0.3"
 
 
 def escolher_microfone():
     dispositivos = sd.query_devices()
-    entrada_padrao = sd.default.device[0]
+    padrao = sd.default.device[0]
 
-    if entrada_padrao is not None and entrada_padrao >= 0:
-        info = sd.query_devices(entrada_padrao, "input")
+    if padrao is not None and 0 <= padrao < len(dispositivos):
+        if dispositivos[padrao]["max_input_channels"] > 0:
+            return padrao, dispositivos[padrao]
+
+    for indice, info in enumerate(dispositivos):
         if info["max_input_channels"] > 0:
-            return entrada_padrao, info
+            return indice, info
 
-    for numero, info in enumerate(dispositivos):
-        if info["max_input_channels"] > 0:
-            return numero, info
-
-    raise RuntimeError(
-        "Nenhum microfone de entrada foi encontrado. "
-        "Verifique se o microfone USB está conectado."
-    )
+    raise RuntimeError("Nenhuma entrada de áudio encontrada. Rode arecord -l.")
 
 
 def main():
-    print("Carregando modelo de português brasileiro...")
-    try:
-        model = Model(MODEL_PATH)
-    except Exception as erro:
-        print(f"Não foi possível carregar o modelo: {erro}")
-        print("Execute primeiro o instalador ou confira a pasta do modelo.")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Transcreve a voz em português.")
+    parser.add_argument("--canal", type=int, choices=(1, 2), default=1,
+                        help="Canal do microfone a transcrever (padrão: 1).")
+    args = parser.parse_args()
 
     try:
-        device_id, device_info = escolher_microfone()
-    except Exception as erro:
-        print(erro)
-        sys.exit(1)
+        dispositivo, info = escolher_microfone()
+        canais = min(2, info["max_input_channels"])
+        if args.canal > canais:
+            raise RuntimeError("O microfone selecionado tem apenas um canal.")
 
-    sample_rate = int(device_info["default_samplerate"])
-    recognizer = KaldiRecognizer(model, sample_rate)
+        taxa = int(info["default_samplerate"])
+        amostras_por_bloco = taxa // 10
 
-    print(f"Microfone: {device_info['name']}")
-    print(f"Taxa de amostragem: {sample_rate} Hz")
-    print("\nAssistente iniciada!")
-    print("Fale em português. Pressione CTRL+C para encerrar.\n")
+        SetLogLevel(-1)
+        print("Carregando o modelo de português...", flush=True)
+        modelo = Model(str(MODELO))
+        reconhecedor = KaldiRecognizer(modelo, taxa)
+        parcial_anterior = ""
 
-    try:
         with sd.RawInputStream(
-            device=device_id,
-            samplerate=sample_rate,
-            blocksize=8000,
+            device=dispositivo,
+            samplerate=taxa,
+            channels=canais,
             dtype="int16",
-            channels=1,
-            callback=audio_callback,
-        ):
-            while True:
-                data = audio_queue.get()
+        ) as entrada:
+            print(f"Microfone: {info['name']}", flush=True)
+            print(f"Taxa: {taxa} Hz | Canal: {args.canal} de {canais}", flush=True)
+            print("Fale uma frase e faça uma pausa. Ctrl+C encerra.", flush=True)
 
-                if recognizer.AcceptWaveform(data):
-                    result = json.loads(recognizer.Result())
-                    text = result.get("text", "").strip()
-                    if text:
-                        print("Você falou:", text)
+            while True:
+                bloco, houve_perda = entrada.read(amostras_por_bloco)
+                if houve_perda:
+                    print("Aviso: perda de amostras de áudio.", file=sys.stderr)
+
+                audio = bytes(bloco)
+                if canais == 2:
+                    amostras = memoryview(audio).cast("h")
+                    audio = amostras[args.canal - 1::2].tobytes()
+
+                if reconhecedor.AcceptWaveform(audio):
+                    texto = json.loads(reconhecedor.Result()).get("text", "")
+                    if texto:
+                        print("Você falou:", texto, flush=True)
+                    parcial_anterior = ""
                 else:
-                    partial = json.loads(recognizer.PartialResult())
-                    partial_text = partial.get("partial", "").strip()
-                    # A transcrição parcial não é exibida para evitar repetição.
+                    parcial = json.loads(reconhecedor.PartialResult()).get("partial", "")
+                    if parcial and parcial != parcial_anterior:
+                        print("Parcial:", parcial, flush=True)
+                    parcial_anterior = parcial
 
     except KeyboardInterrupt:
         print("\nTeste encerrado.")
     except Exception as erro:
-        print(f"\nErro durante a captura de áudio: {erro}")
-        print("Confira o microfone USB e a lista de dispositivos de áudio.")
-        sys.exit(1)
+        print(f"Erro: {erro}", file=sys.stderr)
+        return 1
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
+PY
