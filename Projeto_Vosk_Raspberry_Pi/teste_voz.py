@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Grava 15 segundos e transcreve a fala em português com Vosk."""
+"""Roberta grava 15 segundos, transcreve com Vosk e responde por escrito."""
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
+import unicodedata
 import wave
 from array import array
+from datetime import datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from vosk import KaldiRecognizer, Model, SetLogLevel
 
@@ -18,6 +22,95 @@ TAXA_VOSK = 16000
 PROJETO = Path(__file__).resolve().parent
 MODELO = PROJETO / "vosk-model-small-pt-0.3"
 GRAVACOES = PROJETO / "gravacoes"
+
+
+# Cadastre as frases abaixo em minúsculas e sem acentos.
+PERGUNTAS_HORA = {
+    "que horas sao",
+    "que horas sao agora",
+    "que hora e",
+    "que hora e agora",
+    "que horas e",
+    "qual e a hora",
+    "qual a hora",
+    "qual e o horario",
+    "qual o horario",
+    "qual o horario atual",
+    "me fale a hora",
+    "me fale a horas",
+    "me fale as horas",
+    "me fala a hora",
+    "me fala a horas",
+    "me fala as horas",
+    "me diga a hora",
+    "me diga as horas",
+    "me diga que horas sao",
+    "me diz a hora",
+    "me diz as horas",
+    "diga a hora",
+    "diga as horas",
+    "voce sabe que horas sao",
+    "pode me dizer as horas",
+    "pode me dizer que horas sao",
+}
+
+PERGUNTAS_DATA = {
+    "que dia e hoje",
+    "que dia e hoje mesmo",
+    "qual e a data de hoje",
+    "qual a data de hoje",
+    "qual a data",
+    "qual e a data",
+    "me diga a data",
+    "me fale a data",
+    "hoje e que dia",
+}
+
+RESPOSTAS_FIXAS = {
+    "ola": "Olá!",
+    "oi": "Oi!",
+    "tudo bem": "Olá, eu estou bem.",
+    "como voce esta": "Olá, eu estou bem.",
+    "como vai": "Olá, eu estou bem.",
+    "bom dia": "Bom dia!",
+    "boa tarde": "Boa tarde!",
+    "boa noite": "Boa noite!",
+    "qual e o seu nome": "Eu sou a Roberta.",
+    "qual e seu nome": "Eu sou a Roberta.",
+    "qual seu nome": "Eu sou a Roberta.",
+    "como voce se chama": "Eu sou a Roberta.",
+    "voce e a alexa": "Sou a Roberta. Meu escritório é um Raspberry Pi.",
+    "voce e alexa": "Sou a Roberta. Meu escritório é um Raspberry Pi.",
+    "conte uma piada": "Por que o computador foi ao médico? Porque pegou um vírus.",
+    "me conte uma piada": "Por que o computador foi ao médico? Porque pegou um vírus.",
+    "me conta uma piada": "Por que o computador foi ao médico? Porque pegou um vírus.",
+    "obrigado": "De nada!",
+    "obrigada": "De nada!",
+    "tchau": "Até mais!",
+}
+
+
+def normalizar_comando(texto):
+    decomposto = unicodedata.normalize("NFD", texto.casefold())
+    sem_acentos = "".join(
+        caractere for caractere in decomposto if not unicodedata.combining(caractere)
+    )
+    palavras = re.findall(r"[a-z0-9]+", sem_acentos)
+    frase = " ".join(palavra for palavra in palavras if palavra != "roberta")
+    frase = re.sub(r"^por favor | por favor$", "", frase)
+    return re.sub(r"^(oi|ola) ", "", frase)
+
+
+def responder(texto):
+    comando = normalizar_comando(texto)
+
+    if comando in PERGUNTAS_HORA:
+        return f"Agora são {datetime.now():%H:%M}."
+
+    if comando in PERGUNTAS_DATA:
+        return f"Hoje é {datetime.now():%d/%m/%Y}."
+
+    return RESPOSTAS_FIXAS.get(comando)
 
 
 def escolher_microfone(sd):
@@ -36,8 +129,7 @@ def escolher_microfone(sd):
     raise RuntimeError("Nenhuma entrada de áudio encontrada. Rode arecord -l.")
 
 
-def gravar(sd, dispositivo, taxa, canais):
-    blocos = []
+def gravar(sd, dispositivo, taxa, canais, wav):
     restante = taxa * DURACAO
     houve_perda = False
 
@@ -48,17 +140,15 @@ def gravar(sd, dispositivo, taxa, canais):
         while restante:
             quadros = min(restante, taxa // 5)
             bloco, perda = entrada.read(quadros)
-            blocos.append(bytes(bloco))
+            wav.writeframesraw(bloco)
             houve_perda = houve_perda or perda
             restante -= quadros
 
     if houve_perda:
         print("Aviso: houve perda de amostras durante a captura.", file=sys.stderr)
-    return blocos
 
 
 def criar_pasta():
-    GRAVACOES.mkdir(exist_ok=True)
     numeros = (int(item.name) for item in GRAVACOES.iterdir() if item.name.isdecimal())
     numero = max(numeros, default=0) + 1
     while True:
@@ -80,11 +170,17 @@ def gravar_e_salvar(canal):
         raise RuntimeError("O microfone selecionado tem apenas um canal.")
 
     print(f"Microfone: {info['name']} | {taxa} Hz", flush=True)
-    blocos = gravar(sd, dispositivo, taxa, canais)
-    arquivo = criar_pasta() / "audio.wav"
-    with wave.open(str(arquivo), "wb") as wav:
-        wav.setparams((canais, 2, taxa, 0, "NONE", "not compressed"))
-        wav.writeframes(b"".join(blocos))
+    GRAVACOES.mkdir(exist_ok=True)
+    # Numera a gravação após fechar um WAV completo.
+    with TemporaryDirectory(dir=GRAVACOES) as pasta_temporaria:
+        temporario = Path(pasta_temporaria) / "audio.wav"
+        with wave.open(str(temporario), "wb") as wav:
+            wav.setparams((canais, 2, taxa, taxa * DURACAO, "NONE", "not compressed"))
+            gravar(sd, dispositivo, taxa, canais, wav)
+
+        arquivo = criar_pasta() / "audio.wav"
+        temporario.replace(arquivo)
+
     print(f"Gravação concluída. Áudio salvo em {arquivo}", flush=True)
     return arquivo
 
@@ -181,6 +277,9 @@ def main():
                 texto + "\n" if texto else "", encoding="utf-8"
             )
         print(f"Você falou: {texto}" if texto else "Nenhuma fala reconhecida.")
+        resposta = responder(texto)
+        if resposta is not None:
+            print(f"Roberta: {resposta}")
         return 0
 
     except KeyboardInterrupt:
