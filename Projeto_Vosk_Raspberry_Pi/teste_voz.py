@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Roberta grava 15 segundos, transcreve com Vosk e responde por escrito."""
+"""Roberta encerra a escuta após 3 s de silêncio e transcreve com Vosk."""
 
 import argparse
 import json
@@ -18,6 +18,8 @@ from vosk import KaldiRecognizer, Model, SetLogLevel
 
 
 DURACAO = 15
+SEGUNDOS_SILENCIO = 3
+LIMIAR_SILENCIO = 120  # Nível RMS em PCM de 16 bits, após descontar o nível DC.
 TAXA_VOSK = 16000
 PROJETO = Path(__file__).resolve().parent
 MODELO = PROJETO / "vosk-model-small-pt-0.3"
@@ -129,20 +131,39 @@ def escolher_microfone(sd):
     raise RuntimeError("Nenhuma entrada de áudio encontrada. Rode arecord -l.")
 
 
-def gravar(sd, dispositivo, taxa, canais, wav):
+def gravar(sd, dispositivo, taxa, canais, wav, canal=None):
     restante = taxa * DURACAO
+    quadros_por_bloco = max(1, taxa // 10)
+    limite_silencio = taxa * SEGUNDOS_SILENCIO
+    quadros_em_silencio = 0
+    energia_minima = LIMIAR_SILENCIO ** 2
+    indices_canais = range(canais) if canal is None else (canal - 1,)
     houve_perda = False
 
     with sd.RawInputStream(
         device=dispositivo, samplerate=taxa, channels=canais, dtype="int16"
     ) as entrada:
-        print(f"Gravando por {DURACAO} segundos. Pode falar!", flush=True)
-        while restante:
-            quadros = min(restante, taxa // 5)
+        print(
+            f"Pode falar! Até {DURACAO} s de gravação. "
+            f"A escuta encerra após {SEGUNDOS_SILENCIO} s de silêncio.",
+            flush=True,
+        )
+        while restante and quadros_em_silencio < limite_silencio:
+            quadros = min(restante, quadros_por_bloco, limite_silencio - quadros_em_silencio)
             bloco, perda = entrada.read(quadros)
             wav.writeframesraw(bloco)
             houve_perda = houve_perda or perda
             restante -= quadros
+
+            amostras = memoryview(bloco).cast("h")
+            som_detectado = any(
+                energia_do_canal(amostras[indice::canais]) >= energia_minima
+                for indice in indices_canais
+            )
+            if som_detectado or perda:
+                quadros_em_silencio = 0
+            else:
+                quadros_em_silencio += quadros
 
     if houve_perda:
         print("Aviso: houve perda de amostras durante a captura.", file=sys.stderr)
@@ -175,8 +196,8 @@ def gravar_e_salvar(canal):
     with TemporaryDirectory(dir=GRAVACOES) as pasta_temporaria:
         temporario = Path(pasta_temporaria) / "audio.wav"
         with wave.open(str(temporario), "wb") as wav:
-            wav.setparams((canais, 2, taxa, taxa * DURACAO, "NONE", "not compressed"))
-            gravar(sd, dispositivo, taxa, canais, wav)
+            wav.setparams((canais, 2, taxa, 0, "NONE", "not compressed"))
+            gravar(sd, dispositivo, taxa, canais, wav, canal=canal)
 
         arquivo = criar_pasta() / "audio.wav"
         temporario.replace(arquivo)
