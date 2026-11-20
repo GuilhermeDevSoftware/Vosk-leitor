@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Roberta: reconhecimento em fluxo, calibração de ruído e início por Enter.
+"""Roberta: Enter inicia e conclui a fala; captura máxima de 15 segundos.
 
 Dependências: vosk, sounddevice e numpy. FFmpeg só é necessário em --arquivo.
 Coloque este script ao lado de vosk-model-small-pt-0.3.
 
     python3 roberta_otimizada.py
-    python3 roberta_otimizada.py --silencio 2
+    python3 roberta_otimizada.py --duracao 15
     python3 roberta_otimizada.py --canal 2 --uma-vez
     python3 roberta_otimizada.py --arquivo gravacoes/1/audio.wav
 
-Na calibração inicial, fique em silêncio por 1,2 segundo.
-Depois, Enter inicia uma fala; 'c' recalibra; 'sair' encerra. Ctrl+C também sai.
-O limite de 15 segundos vale para cada captura. --continuo inicia sem Enter.
+Enter inicia uma fala. Durante a captura, outro Enter conclui a fala antes do limite.
+A captura termina automaticamente em 15 segundos, mesmo em silêncio ou com ruído.
+Entre as falas, digite 'sair' para encerrar. Ctrl+C também sai.
+--continuo inicia capturas sem o Enter inicial.
 A redução da espera depende da velocidade do reconhecimento na placa.
 """
 
@@ -28,7 +29,6 @@ import time
 import unicodedata
 import wave
 from array import array
-from collections import deque
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -38,8 +38,6 @@ np = None
 KaldiRecognizer = None
 
 DURACAO = 15
-SEGUNDOS_SILENCIO = 2.0
-LIMIAR_SILENCIO = 120
 TAXA_VOSK = 16000
 PROJETO = Path(__file__).resolve().parent
 MODELO = PROJETO / "vosk-model-small-pt-0.3"
@@ -197,32 +195,53 @@ def configurar_captura(sd, dispositivo, info, canal, taxa_forcada=None):
                        + " | ".join(erros))
 
 
-def calibrar_ruido(sd, dispositivo, taxa, canais, limiar_minimo):
-    """Mede o volume do ambiente por canal, sem carregar/transcrever outro áudio.
+def terminal_interativo():
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, OSError, ValueError):
+        return False
 
-    O limiar é duas vezes o percentil 90 do RMS do ruído, respeitando --limiar.
-    É uma separação por volume, não uma classificação de voz humana: ruído
-    muito variável e pessoas falando perto ainda podem ser interpretados como som.
+
+def limpar_entrada_pendente():
+    """Não deixa um Enter antigo iniciar outra captura após o limite de tempo.
+
+    Não cria threads de leitura bloqueadas: o mesmo terminal é usado tanto pelo
+    input() entre as falas quanto pela verificação de Enter durante a captura.
     """
-    print("\nCalibrando o ruído: fique em silêncio por 1,2 segundo...", flush=True)
-    tamanho_bloco = max(1, round(taxa * 0.1))
-    niveis = []
-    with sd.RawInputStream(device=dispositivo, samplerate=taxa, channels=canais,
-                           dtype="int16", blocksize=tamanho_bloco) as entrada:
-        for _ in range(12):
-            bloco, perda = entrada.read(tamanho_bloco)
-            if not perda:
-                dados = np.frombuffer(bloco, dtype=np.int16).reshape(-1, canais)
-                niveis.append(np.sqrt(dados.astype(np.float32).var(axis=0)))
-    if not niveis:
-        print("Não foi possível medir o ruído sem perdas. Usando o limiar manual.", flush=True)
-        return np.full(canais, float(limiar_minimo))
-    ruido = np.percentile(np.asarray(niveis), 90, axis=0)
-    limiares = np.maximum(float(limiar_minimo), ruido * 2.0)
-    for indice in range(canais):
-        print(f"Canal {indice + 1}: ruído RMS {ruido[indice]:.0f}; "
-              f"limiar {limiares[indice]:.0f}.", flush=True)
-    return limiares
+    if not terminal_interativo():
+        return
+    if sys.platform == "win32":
+        import msvcrt
+        while msvcrt.kbhit():
+            msvcrt.getwch()
+    else:
+        import termios
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+
+
+def enter_pressionado():
+    """Consulta o teclado sem bloquear a captura nem deixar leitores pendurados."""
+    if not terminal_interativo():
+        return False
+    if sys.platform == "win32":
+        import msvcrt
+        while msvcrt.kbhit():
+            tecla = msvcrt.getwch()
+            if tecla == "\x03":
+                raise KeyboardInterrupt
+            if tecla in {"\r", "\n"}:
+                return True
+        return False
+    import select
+    if select.select([sys.stdin], [], [], 0)[0]:
+        import os
+        # O terminal está em modo normal: a linha só fica pronta após Enter.
+        # EOF (Ctrl+D) também conclui a captura, para não esperar o limite.
+        # Lê diretamente do descritor para não deixar linhas extras no buffer
+        # de texto do Python e iniciar a próxima gravação sem querer.
+        os.read(sys.stdin.fileno(), 4096)
+        return True
+    return False
 
 
 class TranscricaoEmFluxo:
@@ -299,19 +318,13 @@ class TranscricaoEmFluxo:
 def capturar_e_transcrever(sd, modelo, dispositivo, taxa, canais, args):
     tamanho_bloco = max(1, round(taxa * 0.1))
     limite_quadros = max(1, round(taxa * args.duracao))
-    limite_silencio = max(1, round(taxa * args.silencio))
-    limite_espera = max(1, round(taxa * args.espera))
-    # Reserva também um lugar para a marca de finalização.
     max_blocos = math.ceil(limite_quadros / tamanho_bloco) + 3
     GRAVACOES.mkdir(parents=True, exist_ok=True)
-    capturados = silenciosos = 0
-    houve_fala = houve_perda = False
-    canal_fixo = args.canal - 1 if args.canal is not None else (0 if canais == 1 else None)
-    antes_da_fala = deque(maxlen=3)  # 300 ms para preservar o início das palavras.
+    capturados = 0
+    houve_perda = False
+    fim_manual = False
+    canais_usados = set()
     fluxo = TranscricaoEmFluxo(modelo, taxa, max_blocos)
-    arquivo = None
-    limiares = np.asarray(getattr(args, "limiares", [args.limiar] * canais), dtype=np.float64)
-    energias_minimas = limiares ** 2
 
     try:
         with TemporaryDirectory(dir=GRAVACOES) as pasta_temporaria:
@@ -320,19 +333,18 @@ def capturar_e_transcrever(sd, modelo, dispositivo, taxa, canais, args):
                 wav.setparams((canais, 2, taxa, 0, "NONE", "not compressed"))
                 with sd.RawInputStream(device=dispositivo, samplerate=taxa, channels=canais,
                                        dtype="int16", blocksize=tamanho_bloco) as entrada:
-                    print(f"\nPode falar! Até {args.duracao:g} s; "
-                          f"encerra após {args.silencio:g} s de silêncio. Ctrl+C sai.", flush=True)
+                    print(f"\nPode falar! Até {args.duracao:g} segundos. "
+                          "Pressione Enter para concluir a fala antes. Ctrl+C sai.", flush=True)
+                    if not terminal_interativo():
+                        print("Sem teclado interativo: a captura seguirá até o limite de tempo.", flush=True)
                     inicio_captura = time.monotonic()
                     while capturados < limite_quadros:
                         if fluxo.erro is not None:
                             raise RuntimeError(f"Falha no reconhecimento: {fluxo.erro}") from fluxo.erro
-                        quadros = min(tamanho_bloco, limite_quadros - capturados)
-                        if houve_fala:
-                            quadros = min(quadros, limite_silencio - silenciosos)
-                        else:
-                            quadros = min(quadros, limite_espera - capturados)
-                        if quadros <= 0:
+                        if enter_pressionado():
+                            fim_manual = True
                             break
+                        quadros = min(tamanho_bloco, limite_quadros - capturados)
                         bloco, perda = entrada.read(quadros)
                         bruto = bytes(bloco)
                         wav.writeframesraw(bruto)
@@ -340,53 +352,35 @@ def capturar_e_transcrever(sd, modelo, dispositivo, taxa, canais, args):
                         capturados += quadros
 
                         dados = np.frombuffer(bruto, dtype=np.int16).reshape(-1, canais)
-                        # NumPy calcula as energias em código nativo, fora de loops Python.
-                        energias = dados.astype(np.float32).var(axis=0)
-                        # Compara o sinal ao ruído próprio de cada canal; o canal
-                        # mais ruidoso não ganha a seleção apenas pelo volume.
-                        candidato = canal_fixo if canal_fixo is not None else int(
-                            (energias / energias_minimas).argmax())
-                        som = float(energias[candidato]) >= energias_minimas[candidato]
-                        mono = dados[:, candidato].astype("<i2", copy=False).tobytes()
-
-                        if not houve_fala:
-                            antes_da_fala.append(bruto)
-                            if som:
-                                houve_fala = True
-                                canal_fixo = candidato
-                                print(f"Canal para o Vosk: {candidato + 1}", flush=True)
-                                for anterior in antes_da_fala:
-                                    # A escolha só fica fixa na primeira fala. Aplica o
-                                    # mesmo canal ao pré-áudio, evitando misturar canais.
-                                    pre = np.frombuffer(anterior, dtype=np.int16).reshape(-1, canais)
-                                    fluxo.enviar(pre[:, candidato].astype("<i2", copy=False).tobytes())
-                                antes_da_fala.clear()
+                        if args.canal is not None:
+                            candidato = args.canal - 1
+                        elif canais == 1:
+                            candidato = 0
                         else:
-                            fluxo.enviar(mono)
-
-                        if houve_fala:
-                            silenciosos = 0 if som or perda else silenciosos + quadros
-                            if silenciosos >= limite_silencio:
-                                break
-                        elif capturados >= limite_espera:
-                            break
+                            # Usa o canal mais forte em cada bloco. Todo o áudio é
+                            # enviado ao Vosk, inclusive voz baixa e pausas; não há
+                            # limiar de ruído nem detecção automática de silêncio.
+                            energias = dados.astype(np.float32).var(axis=0)
+                            candidato = int(energias.argmax())
+                        canais_usados.add(candidato + 1)
+                        mono = dados[:, candidato].astype("<i2", copy=False).tobytes()
+                        fluxo.enviar(mono)
                     fim_captura = time.monotonic()
 
-            # Publica somente WAVs completos com fala; silêncio ocioso não ocupa pastas.
-            if houve_fala:
+            motivo = "Enter" if fim_manual else "limite de duração"
+            if capturados:
                 arquivo = criar_pasta() / "audio.wav"
                 temporario.replace(arquivo)
-                motivo = "silêncio" if silenciosos >= limite_silencio else "limite de duração"
-                print(f"Captura encerrada por {motivo}; finalizando a transcrição...", flush=True)
+                print(f"Fala concluída por {motivo}; finalizando a transcrição...", flush=True)
             texto = fluxo.finalizar()
             finalizado = time.monotonic()
 
         if houve_perda:
             print("Aviso: houve perda de amostras no microfone; a transcrição pode conter falhas.",
                   file=sys.stderr, flush=True)
-        if not houve_fala:
-            print("Nenhum som acima do limiar nesta captura.", flush=True)
-            return None
+        if not capturados:
+            print("Captura encerrada antes de receber áudio.", flush=True)
+            return ""
 
         tempos = {
             "captura_s": round(fim_captura - inicio_captura, 4),
@@ -394,12 +388,11 @@ def capturar_e_transcrever(sd, modelo, dispositivo, taxa, canais, args):
             "audio_enviado_vosk_s": round(fluxo.bytes_processados / (2 * taxa), 4),
             "reconhecimento_acumulado_s": round(fluxo.tempo_processamento, 4),
             "espera_apos_captura_s": round(finalizado - fim_captura, 4),
-            "silencio_final_s": round(silenciosos / taxa, 4),
             "taxa_hz": taxa,
-            "canal": canal_fixo + 1,
+            "canal": args.canal or (1 if canais == 1 else "automático por bloco"),
+            "canais_utilizados": sorted(canais_usados),
             "pico_fila_blocos": fluxo.pico_fila,
             "perda_amostras": houve_perda,
-            "limiares_rms": [round(float(v), 2) for v in limiares],
             "motivo_fim": motivo,
         }
         arquivo.with_name("transcricao.txt").write_text(texto + "\n" if texto else "", encoding="utf-8")
@@ -409,9 +402,6 @@ def capturar_e_transcrever(sd, modelo, dispositivo, taxa, canais, args):
         print(f"Captura: {tempos['captura_s']:.2f} s | "
               f"Reconhecimento acumulado: {tempos['reconhecimento_acumulado_s']:.2f} s | "
               f"Espera após captura: {tempos['espera_apos_captura_s']:.2f} s", flush=True)
-        if motivo == "limite de duração":
-            print("A captura atingiu o limite. Se você já estava em silêncio, "
-                  "recalibre com 'c' ou aumente --limiar.", flush=True)
         return texto
     finally:
         fluxo.cancelar()
@@ -506,15 +496,8 @@ def main():
     parser.add_argument("--listar-microfones", action="store_true", help="lista dispositivos e encerra")
     parser.add_argument("--uma-vez", action="store_true", help="faz apenas uma captura e encerra")
     parser.add_argument("--continuo", action="store_true", help="inicia capturas sem esperar Enter")
-    parser.add_argument("--sem-calibracao", action="store_true", help="usa somente o --limiar manual")
-    parser.add_argument("--silencio", type=positivo, default=SEGUNDOS_SILENCIO,
-                        help="silêncio após a fala, em segundos (padrão: 2)")
     parser.add_argument("--duracao", type=positivo, default=DURACAO,
                         help="limite total de cada captura em segundos (padrão: 15)")
-    parser.add_argument("--espera", type=positivo, default=8,
-                        help="espera inicial por fala em segundos (padrão: 8)")
-    parser.add_argument("--limiar", type=positivo, default=LIMIAR_SILENCIO,
-                        help="limiar RMS mínimo; a calibração pode elevá-lo (padrão: 120)")
     parser.add_argument("--taxa", type=int, help="força a frequência de captura, em Hz (mínimo: 16000)")
     args = parser.parse_args()
     if args.taxa is not None and args.taxa < TAXA_VOSK:
@@ -554,20 +537,15 @@ def main():
         print(f"Microfone: {info['name']} | {taxa} Hz | {canais} canal(is)", flush=True)
         if taxa != TAXA_VOSK:
             print("O microfone usa a frequência acima; o Vosk fará a redução internamente.", flush=True)
-        args.limiares = np.full(canais, float(args.limiar))
-        if not args.sem_calibracao:
-            args.limiares = calibrar_ruido(sd, dispositivo, taxa, canais, args.limiar)
         print("\nA Roberta está pronta. O modelo continuará carregado entre as falas.", flush=True)
         while True:
             if not args.continuo:
-                escolha = input("\nEnter para falar, 'c' para calibrar "
+                limpar_entrada_pendente()
+                escolha = input("\nLeia a resposta com calma. Enter para iniciar a fala "
                                 "ou 'sair': ").strip().casefold()
                 if escolha in {"sair", "q", "exit"}:
                     print("Roberta encerrada.")
                     return 0
-                if escolha in {"c", "calibrar"}:
-                    args.limiares = calibrar_ruido(sd, dispositivo, taxa, canais, args.limiar)
-                    continue
                 if escolha:
                     print("Pressione apenas Enter para iniciar uma fala.", flush=True)
                     continue
