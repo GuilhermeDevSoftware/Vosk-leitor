@@ -1,30 +1,47 @@
 #!/usr/bin/env python3
-"""Roberta encerra a escuta após 3 s de silêncio e transcreve com Vosk."""
+"""Roberta: captura e reconhecimento simultâneos, com modelo mantido na memória.
+
+Dependências: vosk, sounddevice e numpy. FFmpeg só é necessário em --arquivo.
+Coloque este script ao lado de vosk-model-small-pt-0.3.
+
+    python3 roberta_otimizada.py
+    python3 roberta_otimizada.py --silencio 1.5
+    python3 roberta_otimizada.py --canal 2 --uma-vez
+    python3 roberta_otimizada.py --arquivo gravacoes/1/audio.wav
+
+Ctrl+C encerra o programa. O limite de 15 segundos vale para cada captura.
+A redução da espera depende da velocidade do reconhecimento na placa.
+"""
 
 import argparse
 import json
+import math
+import queue
 import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import unicodedata
 import wave
 from array import array
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from vosk import KaldiRecognizer, Model, SetLogLevel
-
+# As dependências são carregadas em main(), para --help funcionar sem instalá-las.
+np = None
+KaldiRecognizer = None
 
 DURACAO = 15
-SEGUNDOS_SILENCIO = 3
-LIMIAR_SILENCIO = 120  # Nível RMS em PCM de 16 bits, após descontar o nível DC.
+SEGUNDOS_SILENCIO = 1.0
+LIMIAR_SILENCIO = 120
 TAXA_VOSK = 16000
 PROJETO = Path(__file__).resolve().parent
 MODELO = PROJETO / "vosk-model-small-pt-0.3"
 GRAVACOES = PROJETO / "gravacoes"
-
 
 # Cadastre as frases abaixo em minúsculas e sem acentos.
 PERGUNTAS_HORA = {
@@ -115,62 +132,15 @@ def responder(texto):
     return RESPOSTAS_FIXAS.get(comando)
 
 
-def escolher_microfone(sd):
-    dispositivos = sd.query_devices()
-    padrao = sd.default.device[0]
-
-    if padrao is not None and 0 <= padrao < len(dispositivos):
-        info = dispositivos[padrao]
-        if info["max_input_channels"] > 0:
-            return padrao, info
-
-    for indice, info in enumerate(dispositivos):
-        if info["max_input_channels"] > 0:
-            return indice, info
-
-    raise RuntimeError("Nenhuma entrada de áudio encontrada. Rode arecord -l.")
-
-
-def gravar(sd, dispositivo, taxa, canais, wav, canal=None):
-    restante = taxa * DURACAO
-    quadros_por_bloco = max(1, taxa // 10)
-    limite_silencio = taxa * SEGUNDOS_SILENCIO
-    quadros_em_silencio = 0
-    energia_minima = LIMIAR_SILENCIO ** 2
-    indices_canais = range(canais) if canal is None else (canal - 1,)
-    houve_perda = False
-
-    with sd.RawInputStream(
-        device=dispositivo, samplerate=taxa, channels=canais, dtype="int16"
-    ) as entrada:
-        print(
-            f"Pode falar! Até {DURACAO} s de gravação. "
-            f"A escuta encerra após {SEGUNDOS_SILENCIO} s de silêncio.",
-            flush=True,
-        )
-        while restante and quadros_em_silencio < limite_silencio:
-            quadros = min(restante, quadros_por_bloco, limite_silencio - quadros_em_silencio)
-            bloco, perda = entrada.read(quadros)
-            wav.writeframesraw(bloco)
-            houve_perda = houve_perda or perda
-            restante -= quadros
-
-            amostras = memoryview(bloco).cast("h")
-            som_detectado = any(
-                energia_do_canal(amostras[indice::canais]) >= energia_minima
-                for indice in indices_canais
-            )
-            if som_detectado or perda:
-                quadros_em_silencio = 0
-            else:
-                quadros_em_silencio += quadros
-
-    if houve_perda:
-        print("Aviso: houve perda de amostras durante a captura.", file=sys.stderr)
+def energia_do_canal(amostras):
+    """Variância em ponto flutuante: remove DC sem estourar o inteiro de 16 bits."""
+    dados = np.asarray(amostras, dtype=np.float32)
+    return float(dados.var()) if dados.size else 0.0
 
 
 def criar_pasta():
-    numeros = (int(item.name) for item in GRAVACOES.iterdir() if item.name.isdecimal())
+    GRAVACOES.mkdir(parents=True, exist_ok=True)
+    numeros = (int(p.name) for p in GRAVACOES.iterdir() if p.is_dir() and p.name.isdecimal())
     numero = max(numeros, default=0) + 1
     while True:
         pasta = GRAVACOES / str(numero)
@@ -181,37 +151,231 @@ def criar_pasta():
             numero += 1
 
 
-def gravar_e_salvar(canal):
-    import sounddevice as sd
-
-    dispositivo, info = escolher_microfone(sd)
-    taxa = int(info["default_samplerate"])
-    canais = min(2, info["max_input_channels"])
-    if canal == 2 and canais == 1:
-        raise RuntimeError("O microfone selecionado tem apenas um canal.")
-
-    print(f"Microfone: {info['name']} | {taxa} Hz", flush=True)
-    GRAVACOES.mkdir(exist_ok=True)
-    # Numera a gravação após fechar um WAV completo.
-    with TemporaryDirectory(dir=GRAVACOES) as pasta_temporaria:
-        temporario = Path(pasta_temporaria) / "audio.wav"
-        with wave.open(str(temporario), "wb") as wav:
-            wav.setparams((canais, 2, taxa, 0, "NONE", "not compressed"))
-            gravar(sd, dispositivo, taxa, canais, wav, canal=canal)
-
-        arquivo = criar_pasta() / "audio.wav"
-        temporario.replace(arquivo)
-
-    print(f"Gravação concluída. Áudio salvo em {arquivo}", flush=True)
-    return arquivo
+def escolher_microfone(sd, dispositivo=None):
+    if dispositivo is not None:
+        info = sd.query_devices(dispositivo, "input")
+        return dispositivo, info
+    dispositivos = sd.query_devices()
+    padrao = sd.default.device[0]
+    if padrao is not None and 0 <= padrao < len(dispositivos):
+        info = dispositivos[padrao]
+        if info["max_input_channels"] > 0:
+            return padrao, info
+    for indice, info in enumerate(dispositivos):
+        if info["max_input_channels"] > 0:
+            return indice, info
+    raise RuntimeError("Nenhuma entrada de áudio encontrada. Rode arecord -l.")
 
 
-def energia_do_canal(amostras):
-    if not amostras:
-        return 0
-    media = sum(amostras) / len(amostras)
-    # A variância mede o sinal sem contar o deslocamento DC como volume.
-    return sum(valor * valor for valor in amostras) / len(amostras) - media**2
+def configurar_captura(sd, dispositivo, info, canal, taxa_forcada=None):
+    """Tenta 16 kHz; se indisponível, informa ao Vosk a frequência real da captura.
+
+    Mantém dois canais quando disponíveis, para não perder um microfone USB
+    cujo sinal útil esteja somente no canal 2. Só um canal chega ao Vosk.
+    """
+    max_canais = min(2, int(info["max_input_channels"]))
+    if max_canais < 1 or (canal == 2 and max_canais < 2):
+        raise RuntimeError("O microfone selecionado não possui o canal solicitado.")
+    taxas = [taxa_forcada] if taxa_forcada else [TAXA_VOSK, int(info["default_samplerate"])]
+    candidatos_canais = [max_canais]
+    if max_canais == 2 and canal != 2:
+        candidatos_canais.append(1)
+    erros = []
+    for taxa in dict.fromkeys(taxas):
+        if taxa < TAXA_VOSK:
+            continue
+        for canais in candidatos_canais:
+            try:
+                sd.check_input_settings(device=dispositivo, samplerate=taxa,
+                                        channels=canais, dtype="int16")
+                return taxa, canais
+            except (ValueError, sd.PortAudioError) as erro:
+                erros.append(str(erro))
+    raise RuntimeError("Não foi possível configurar o microfone em 16 kHz ou mais. "
+                       + " | ".join(erros))
+
+
+class TranscricaoEmFluxo:
+    """Um único consumidor usa o reconhecedor; a captura só entrega blocos mono.
+
+    A fila comporta a captura inteira, mas possui limite de memória. Nenhum bloco
+    é descartado para esconder lentidão. O Vosk continua sequencial para uma fala.
+    """
+
+    def __init__(self, modelo, taxa, max_blocos):
+        self.modelo = modelo
+        self.taxa = taxa
+        self.fila = queue.Queue(maxsize=max_blocos)
+        self.parar = threading.Event()
+        self.erro = None
+        self.texto = ""
+        self.tempo_processamento = 0.0
+        self.bytes_processados = 0
+        self.pico_fila = 0
+        self.thread = threading.Thread(target=self._executar, daemon=True)
+        self.thread.start()
+
+    def _executar(self):
+        try:
+            inicio = time.monotonic()
+            reconhecedor = KaldiRecognizer(self.modelo, self.taxa)
+            self.tempo_processamento += time.monotonic() - inicio
+            trechos = []
+            while not self.parar.is_set():
+                try:
+                    bloco = self.fila.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if bloco is None:
+                    inicio = time.monotonic()
+                    final = json.loads(reconhecedor.FinalResult()).get("text", "").strip()
+                    self.tempo_processamento += time.monotonic() - inicio
+                    if final:
+                        trechos.append(final)
+                    self.texto = " ".join(trechos)
+                    return
+                inicio = time.monotonic()
+                if reconhecedor.AcceptWaveform(bloco):
+                    trecho = json.loads(reconhecedor.Result()).get("text", "").strip()
+                    if trecho:
+                        trechos.append(trecho)
+                self.tempo_processamento += time.monotonic() - inicio
+                self.bytes_processados += len(bloco)
+        except Exception as erro:
+            self.erro = erro
+
+    def enviar(self, bloco):
+        if self.erro is not None:
+            raise RuntimeError(f"Falha no reconhecimento: {self.erro}") from self.erro
+        try:
+            self.fila.put_nowait(bloco)
+        except queue.Full as erro:
+            raise RuntimeError("A fila de áudio ficou cheia; a captura foi interrompida.") from erro
+        self.pico_fila = max(self.pico_fila, self.fila.qsize())
+
+    def finalizar(self):
+        self.enviar(None)
+        while self.thread.is_alive():
+            self.thread.join(timeout=0.1)
+        if self.erro is not None:
+            raise RuntimeError(f"Falha no reconhecimento: {self.erro}") from self.erro
+        return self.texto
+
+    def cancelar(self):
+        self.parar.set()
+        self.thread.join(timeout=0.2)
+
+
+def capturar_e_transcrever(sd, modelo, dispositivo, taxa, canais, args):
+    tamanho_bloco = max(1, round(taxa * 0.1))
+    limite_quadros = max(1, round(taxa * args.duracao))
+    limite_silencio = max(1, round(taxa * args.silencio))
+    limite_espera = max(1, round(taxa * args.espera))
+    # Reserva também um lugar para a marca de finalização.
+    max_blocos = math.ceil(limite_quadros / tamanho_bloco) + 3
+    GRAVACOES.mkdir(parents=True, exist_ok=True)
+    capturados = silenciosos = 0
+    houve_fala = houve_perda = False
+    canal_fixo = args.canal - 1 if args.canal is not None else (0 if canais == 1 else None)
+    antes_da_fala = deque(maxlen=3)  # 300 ms para preservar o início das palavras.
+    fluxo = TranscricaoEmFluxo(modelo, taxa, max_blocos)
+    arquivo = None
+
+    try:
+        with TemporaryDirectory(dir=GRAVACOES) as pasta_temporaria:
+            temporario = Path(pasta_temporaria) / "audio.wav"
+            with wave.open(str(temporario), "wb") as wav:
+                wav.setparams((canais, 2, taxa, 0, "NONE", "not compressed"))
+                with sd.RawInputStream(device=dispositivo, samplerate=taxa, channels=canais,
+                                       dtype="int16", blocksize=tamanho_bloco) as entrada:
+                    print(f"\nPode falar! Até {args.duracao:g} s; "
+                          f"encerra após {args.silencio:g} s de silêncio. Ctrl+C sai.", flush=True)
+                    inicio_captura = time.monotonic()
+                    while capturados < limite_quadros:
+                        if fluxo.erro is not None:
+                            raise RuntimeError(f"Falha no reconhecimento: {fluxo.erro}") from fluxo.erro
+                        quadros = min(tamanho_bloco, limite_quadros - capturados)
+                        if houve_fala:
+                            quadros = min(quadros, limite_silencio - silenciosos)
+                        else:
+                            quadros = min(quadros, limite_espera - capturados)
+                        if quadros <= 0:
+                            break
+                        bloco, perda = entrada.read(quadros)
+                        bruto = bytes(bloco)
+                        wav.writeframesraw(bruto)
+                        houve_perda = houve_perda or perda
+                        capturados += quadros
+
+                        dados = np.frombuffer(bruto, dtype=np.int16).reshape(-1, canais)
+                        # NumPy calcula as energias em código nativo, fora de loops Python.
+                        energias = dados.astype(np.float32).var(axis=0)
+                        candidato = canal_fixo if canal_fixo is not None else int(energias.argmax())
+                        som = float(energias[candidato]) >= args.limiar ** 2
+                        mono = dados[:, candidato].astype("<i2", copy=False).tobytes()
+
+                        if not houve_fala:
+                            antes_da_fala.append(bruto)
+                            if som:
+                                houve_fala = True
+                                canal_fixo = candidato
+                                print(f"Canal para o Vosk: {candidato + 1}", flush=True)
+                                for anterior in antes_da_fala:
+                                    # A escolha só fica fixa na primeira fala. Aplica o
+                                    # mesmo canal ao pré-áudio, evitando misturar canais.
+                                    pre = np.frombuffer(anterior, dtype=np.int16).reshape(-1, canais)
+                                    fluxo.enviar(pre[:, candidato].astype("<i2", copy=False).tobytes())
+                                antes_da_fala.clear()
+                        else:
+                            fluxo.enviar(mono)
+
+                        if houve_fala:
+                            silenciosos = 0 if som or perda else silenciosos + quadros
+                            if silenciosos >= limite_silencio:
+                                break
+                        elif capturados >= limite_espera:
+                            break
+                    fim_captura = time.monotonic()
+
+            # Publica somente WAVs completos com fala; silêncio ocioso não ocupa pastas.
+            if houve_fala:
+                arquivo = criar_pasta() / "audio.wav"
+                temporario.replace(arquivo)
+                print("Captura encerrada; finalizando a transcrição...", flush=True)
+            texto = fluxo.finalizar()
+            finalizado = time.monotonic()
+
+        if houve_perda:
+            print("Aviso: houve perda de amostras no microfone; a transcrição pode conter falhas.",
+                  file=sys.stderr, flush=True)
+        if not houve_fala:
+            print("Nenhum som acima do limiar. Aguardando uma nova fala...", flush=True)
+            return None
+
+        tempos = {
+            "captura_s": round(fim_captura - inicio_captura, 4),
+            "audio_capturado_s": round(capturados / taxa, 4),
+            "audio_enviado_vosk_s": round(fluxo.bytes_processados / (2 * taxa), 4),
+            "reconhecimento_acumulado_s": round(fluxo.tempo_processamento, 4),
+            "espera_apos_captura_s": round(finalizado - fim_captura, 4),
+            "silencio_final_s": round(silenciosos / taxa, 4),
+            "taxa_hz": taxa,
+            "canal": canal_fixo + 1,
+            "pico_fila_blocos": fluxo.pico_fila,
+            "perda_amostras": houve_perda,
+        }
+        arquivo.with_name("transcricao.txt").write_text(texto + "\n" if texto else "", encoding="utf-8")
+        arquivo.with_name("tempos.json").write_text(
+            json.dumps(tempos, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(f"Áudio salvo em {arquivo}", flush=True)
+        print(f"Captura: {tempos['captura_s']:.2f} s | "
+              f"Reconhecimento acumulado: {tempos['reconhecimento_acumulado_s']:.2f} s | "
+              f"Espera após captura: {tempos['espera_apos_captura_s']:.2f} s", flush=True)
+        print("O reconhecimento acumulado acontece em paralelo à captura; os tempos não se somam.",
+              flush=True)
+        return texto
+    finally:
+        fluxo.cancelar()
 
 
 def canais_para_transcrever(arquivo, canal):
@@ -273,39 +437,95 @@ def transcrever(arquivo, modelo, canal):
     return ""
 
 
+def mostrar_resposta(texto):
+    print(f"Você falou: {texto}" if texto else "Nenhuma fala reconhecida.", flush=True)
+    resposta = responder(texto)
+    if resposta is not None:
+        print(f"Roberta: {resposta}", flush=True)
+
+
+def positivo(valor):
+    numero = float(valor)
+    if not math.isfinite(numero) or numero <= 0:
+        raise argparse.ArgumentTypeError("Use um número finito maior que zero.")
+    return numero
+
+
+def dispositivo_ou_nome(valor):
+    try:
+        return int(valor)
+    except ValueError:
+        return valor
+
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--canal", type=int, choices=(1, 2),
-        help="força o canal indicado. Por padrão, a seleção é automática",
-    )
-    parser.add_argument("--arquivo", type=Path, help="mostra a transcrição de um WAV já gravado")
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--canal", type=int, choices=(1, 2), help="força o canal; padrão: seleção automática")
+    parser.add_argument("--arquivo", type=Path, help="transcreve um WAV salvo e encerra (usa FFmpeg)")
+    parser.add_argument("--modelo", type=Path, default=MODELO, help="pasta do modelo Vosk")
+    parser.add_argument("--dispositivo", type=dispositivo_ou_nome, help="índice ou nome do microfone")
+    parser.add_argument("--listar-microfones", action="store_true", help="lista dispositivos e encerra")
+    parser.add_argument("--uma-vez", action="store_true", help="faz apenas uma captura e encerra")
+    parser.add_argument("--silencio", type=positivo, default=SEGUNDOS_SILENCIO,
+                        help="silêncio após a fala, em segundos (padrão: 1)")
+    parser.add_argument("--duracao", type=positivo, default=DURACAO,
+                        help="limite total de cada captura em segundos (padrão: 15)")
+    parser.add_argument("--espera", type=positivo, default=8,
+                        help="espera inicial por fala em segundos (padrão: 8)")
+    parser.add_argument("--limiar", type=positivo, default=LIMIAR_SILENCIO,
+                        help="limiar RMS para separar som de silêncio (padrão: 120)")
+    parser.add_argument("--taxa", type=int, help="força a frequência de captura, em Hz (mínimo: 16000)")
     args = parser.parse_args()
+    if args.taxa is not None and args.taxa < TAXA_VOSK:
+        parser.error("--taxa deve ser pelo menos 16000 Hz para este modelo.")
 
     try:
-        if shutil.which("ffmpeg") is None:
-            raise RuntimeError("Instale o FFmpeg com sudo apt install ffmpeg.")
+        # Importa sounddevice somente no modo de microfone.
+        if args.listar_microfones or args.arquivo is None:
+            import sounddevice as sd
+            if args.listar_microfones:
+                print(sd.query_devices())
+                return 0
+        global np, KaldiRecognizer
+        import numpy as np
+        from vosk import KaldiRecognizer, Model, SetLogLevel
 
+        if not args.modelo.is_dir():
+            raise RuntimeError(f"Modelo não encontrado: {args.modelo}. "
+                               "Coloque a pasta ao lado do script ou informe --modelo.")
+        if args.arquivo is not None and shutil.which("ffmpeg") is None:
+            raise RuntimeError("Para --arquivo, instale o FFmpeg: sudo apt install ffmpeg")
         SetLogLevel(-1)
-        print("Carregando o modelo de português...", flush=True)
-        modelo = Model(str(MODELO))
+        print("Carregando o modelo de português (uma vez nesta execução)...", flush=True)
+        inicio = time.monotonic()
+        modelo = Model(str(args.modelo))
+        print(f"Modelo pronto em {time.monotonic() - inicio:.2f} s.", flush=True)
 
-        arquivo = args.arquivo or gravar_e_salvar(args.canal)
-        print("Transcrevendo...", flush=True)
-        texto = transcrever(arquivo, modelo, args.canal)
-        if args.arquivo is None:
-            arquivo.with_name("transcricao.txt").write_text(
-                texto + "\n" if texto else "", encoding="utf-8"
-            )
-        print(f"Você falou: {texto}" if texto else "Nenhuma fala reconhecida.")
-        resposta = responder(texto)
-        if resposta is not None:
-            print(f"Roberta: {resposta}")
-        return 0
+        if args.arquivo is not None:
+            inicio = time.monotonic()
+            texto = transcrever(args.arquivo, modelo, args.canal)
+            mostrar_resposta(texto)
+            print(f"Conversão e reconhecimento do arquivo: {time.monotonic() - inicio:.2f} s")
+            return 0
 
+        dispositivo, info = escolher_microfone(sd, args.dispositivo)
+        taxa, canais = configurar_captura(sd, dispositivo, info, args.canal, args.taxa)
+        print(f"Microfone: {info['name']} | {taxa} Hz | {canais} canal(is)", flush=True)
+        if taxa != TAXA_VOSK:
+            print("O microfone usa a frequência acima; o Vosk fará a redução internamente.", flush=True)
+        while True:
+            texto = capturar_e_transcrever(sd, modelo, dispositivo, taxa, canais, args)
+            if texto is not None:
+                mostrar_resposta(texto)
+            if args.uma_vez:
+                return 0
     except KeyboardInterrupt:
-        print("\nExecução interrompida.")
+        print("\nRoberta encerrada.")
         return 130
+    except ImportError as erro:
+        print(f"Dependência ausente: {erro}. No ambiente Python da Roberta, instale:\n"
+              "python3 -m pip install vosk sounddevice numpy", file=sys.stderr)
+        return 1
     except Exception as erro:
         print(f"Erro: {erro}", file=sys.stderr)
         return 1
